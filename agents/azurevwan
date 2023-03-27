@@ -1,0 +1,438 @@
+#!/usr/bin/env python
+# pylint: disable=invalid-name,too-few-public-methods,missing-docstring
+#
+# We must disable 'invalid-name' for this, as pacemaker's python interface enforces
+# class names to start with OCFParameter_*, which causes pylint to complain:
+#  C: 94, 4: Class name "OCFParameter_interface" doesn't conform to PascalCase naming style (invalid-name)
+#
+# -*- coding: utf-8 -*-
+#
+# Coding a resource agent in Python makes for some awkward code. Standard RAs
+# using shell script heavily rely on return codes. The ocfagent framework
+# implements them as exceptions, but of course, there is a difference between
+# the "good" OCFSuccess exception and the other "bad" ones.
+# In order to correctly interface with the CRM, the OCF* exceptions will call
+# SystemExit with the proper return code, so it's generally fine to not catch
+# them. The only exception is in fact OCFSuccess and other Python exceptions.
+
+"""
+This is HA for Azure VirtualWAN resource agent for Pacemaker.
+Its task is to update the static routes of a specific Virtual Network
+connection via Azure API on "start" to make sure those routes point to us. Then
+it checks that those routes still point to us on "monitor". We don't do
+anything on "stop".
+"""
+
+from __future__ import print_function
+import sys
+import traceback
+import signal
+import logging
+import time
+# This is the backport from https://pypi.python.org/pypi/ipaddress
+import ipaddress
+import netifaces
+
+# OCF Python framework
+from ocfagent.agent import ResourceAgent
+import ocfagent.error as ocferr
+import ocfagent.parameter as ocfpar
+
+# Azure modules
+from azure.identity import ManagedIdentityCredential, CredentialUnavailableError
+from azure.mgmt.network import NetworkManagementClient
+from azure.core.exceptions import HttpResponseError, ClientAuthenticationError
+from azure.core.pipeline.policies import RetryPolicy
+
+
+class LogAdapter(logging.LoggerAdapter):
+    """Enhances each log message with delta t (from start of the execution)"""
+    def process(self, msg, kwargs):
+        return '[+%.1f s] %s' % (time.time() - self.extra['ts_start'], msg), kwargs
+
+
+class AzureVWanHa(ResourceAgent):
+    """Azure vWAN HA OCF agent"""
+    VERSION = "1.0"
+    SHORTDESC = "Azure vWAN HA agent"
+    LONGDESC = "Azure vWAN HA agent that updates Virtual Network connection's \
+                static routes tables during fail-overs"
+
+    #########################################################
+    # Parameters. These are taken from pcmk.res.conf.xml    #
+    #########################################################
+    class OCFParameter_managed_identity_id(ocfpar.ResourceStringParameter):
+        """
+        User-assigned Managed Identity resource ID
+
+        Resource ID of the user-assigned Managed Identity used to perfrom the API calls.
+        """
+        @property
+        def required(self):
+            return True
+
+    class OCFParameter_subscription_id(ocfpar.ResourceStringParameter):
+        """
+        Azure subscription ID
+
+        Subscription ID of the Subscription where the services are hosted.
+        """
+        @property
+        def required(self):
+            return True
+
+    class OCFParameter_resource_group(ocfpar.ResourceStringParameter):
+        """
+        Resource group resources belong to
+
+        Name of the Resource Group in which the resource (vHub, Virtual Network
+        Connection) is located.
+        """
+        @property
+        def required(self):
+            return True
+
+    class OCFParameter_vhub(ocfpar.ResourceStringParameter):
+        """
+        vhub to which the connection is attached
+
+        Name of the Virtual Hub to which the connection we have to update
+        is attached.
+        """
+
+        @property
+        def required(self):
+            return True
+
+    class OCFParameter_connection(ocfpar.ResourceStringParameter):
+        """
+        connection on which the static routes are configured
+
+        Name of the Virtual Network connection on which the static routes we
+        have to update are configured.
+        """
+
+        @property
+        def required(self):
+            return True
+
+
+    class OCFParameter_interface(ocfpar.ResourceStringParameter):
+        """
+        Interface whose IP will be used as next-hop in the static routes
+
+        The interface name will be resolved to an IP and a subnet. Any static
+        route configured on the Virtual Network connection selected via the
+        "connection" parameter that has a next-hop within our own subnet will
+        be updated to use our IP address instead.
+        """
+
+        @property
+        def required(self):
+            return True
+
+    class ApiCallTimeoutException(Exception):
+        """Exception that is raised if SIGALRM is triggered"""
+        pass
+
+    def __init__(self, testmode=False, api_call_timeout=17, debug_logging_enabled=False):
+        super(AzureVWanHa, self).__init__(testmode=testmode)
+
+        # Init
+        self._api_call_timeout = api_call_timeout
+        self._our_address = None
+        # An instance of a NetworkManagementClient, created in handle_validate_all()
+        self._NMC = None
+        # The object representing the configured Virtual Network connection;
+        # populated in handle_validate_all()
+        self._connection = None
+        # A list of static routes found in the configured Virtual Network connection;
+        # also populated in handle_validate_all()
+        self._routes = None
+
+        # LOGGING
+        logger = logging.getLogger('azurevwan')
+        if debug_logging_enabled:
+            logger.setLevel(logging.DEBUG)
+        else:
+            logger.setLevel(logging.INFO)
+        logformat = '%(levelname)s: %(name)s[%(process)s]: %(message)s'
+        # stdout
+        outh = logging.StreamHandler(sys.stdout)
+        outh.formatter = logging.Formatter(logformat)
+        logger.addHandler(outh)
+        # stderr
+        errh = logging.StreamHandler(sys.stderr)
+        errh.formatter = logging.Formatter(logformat)
+        errh.setLevel(logging.ERROR)
+        logger.addHandler(errh)
+
+        self.log = LogAdapter(logger, {'ts_start': time.time()})
+
+        # Register the signal function handler
+        signal.signal(signal.SIGALRM, self.call_signal_handler)
+
+
+    def call_signal_handler(self, signum, frame):
+        """Handler that kills API call if it was not successful withing given time"""
+        message = 'API call not completed within {} seconds'.format(self._api_call_timeout)
+        raise self.ApiCallTimeoutException(message)
+
+    ####################################
+    # Handlers for the various actions #
+    ####################################
+    def handle_start(self, timeout=300):
+        """When starting, divert all traffic to us"""
+        self.log.info('START target has been called for rg=%s, interface=%s, connection=%s, timeout=%d',
+                      self.get_parameter('resource_group'),
+                      self.get_parameter('interface'),
+                      self.get_parameter('connection'),
+                      timeout)
+        try:
+            # Calling validate_all to initialise variables
+            validated = False
+            while not validated:
+                try:
+                    self.handle_validate_all()
+                except:
+                    self.log.warning('validate_all failed. Waiting 5s and trying again')
+                    time.sleep(5)
+                else:
+                    self.log.debug('validate_all returned successfully')
+                    validated = True
+
+            update_needed = False
+            for route in self._routes:
+                next_hop = ipaddress.ip_address(route.next_hop_ip_address)
+                # Update routes to point to us
+                if (next_hop in self._our_address.network and next_hop != self._our_address.ip):
+                    route.next_hop_ip_address = str(self._our_address.ip)
+                    update_needed = True
+                    self.log.info('Route %s needs to be updated to point to us (%s)',
+                                  route.name, route.next_hop_ip_address)
+
+            if update_needed:
+                self.log.info('Calling API to update the Virtual Network connection with the updated static routes')
+                # The call is asynchronous so we only know that it has been accepted
+                # Next monitor operation will confirm that all is OK
+                azLogPoller = (
+                        self._NMC
+                        .hub_virtual_network_connections
+                        .begin_create_or_update(
+                            resource_group_name=self.get_parameter('resource_group'),
+                            virtual_hub_name=self.get_parameter('vhub'),
+                            connection_name=self.get_parameter('connection'),
+                            hub_virtual_network_connection_parameters=self._connection,
+                        )
+                )
+                self.log.info('Update Virtual Network connection API call done. Waiting for completion')
+
+                # wait for the update call to succeed
+                azLogPoller.wait()
+                self.log.info('API call completed successfully')
+            else:
+                # All the static routes are already pointing to us
+                self.log.info('The static routes are already pointing to us')
+        except (ClientAuthenticationError, HttpResponseError) as aze:
+            # error response to API call
+            self.log.error(aze.message)
+            raise ocferr.OCFErrGeneric(aze.message)
+        except:
+            exctype, value = sys.exc_info()[:2]
+            self.log.error('uncaught error: %s - %s', exctype, value)
+            self.log.error('unspecified error while updating the Virtual Network connection')
+            raise ocferr.OCFErrGeneric('unspecified error while updating the Virtual Network connection')
+        else:
+            self.log.info('start operation successful')
+            raise ocferr.OCFSuccess('started successfully')
+
+    def handle_stop(self, timeout=300):
+        """
+        We can't actually stop. Only calling start on the neighbor will
+        change the static routes on the Virtual Network connection.
+        """
+        self.log.info('STOP target has been called for rg=%s, interface=%s, connection=%s - nothing done',
+                      self.get_parameter('resource_group'),
+                      self.get_parameter('interface'),
+                      self.get_parameter('connection'))
+        raise ocferr.OCFSuccess("resource agent stopped")
+
+    def handle_monitor(self, timeout=20):
+        """Check if we are the next-hop in the static routes on the Virtual Network connection"""
+        if 'OCF_RESKEY_CRM_meta_interval' in self.OCF_ENVIRON \
+           and self.OCF_ENVIRON['OCF_RESKEY_CRM_meta_interval'] != '0':
+            msg_details = 'interval={}, ignoring API errors'.\
+                          format(self.OCF_ENVIRON['OCF_RESKEY_CRM_meta_interval'])
+            ignore_errors = True
+        else:
+            msg_details = 'probe operation, NOT ignoring API errors'
+            ignore_errors = False
+        self.log.debug('monitor target has been called for rg=%s, interface=%s, connection=%s (%s)',
+                       self.get_parameter('resource_group'),
+                       self.get_parameter('interface'),
+                       self.get_parameter('connection'),
+                       msg_details)
+        try:
+            # Calling validate_all to initialise variables
+            self.handle_validate_all()
+            self.log.debug('validate_all returned successfully')
+            # Partition the routes depending on whether they point to us or
+            # to a "peer". Ignore next hops in other subnets
+            routes_to_us, routes_to_elsewhere = [], []
+            for route in self._routes:
+                next_hop = ipaddress.ip_address(route.next_hop_ip_address)
+                if next_hop in self._our_address.network:
+                    if next_hop == self._our_address.ip:
+                        routes_to_us.append(route)
+                    else:
+                        routes_to_elsewhere.append(route)
+                else:
+                    # We don't care about other types of routes
+                    pass
+            # to_us | to_peer | state
+            #     0 |      0  | Misconfiguration
+            #     1 |      0  | Running OK
+            #     0 |      1  | Not running
+            #     1 |      1  | Generir error
+            if not routes_to_us and not routes_to_elsewhere:
+                msg = 'None of static routes are pointing to an address in our subnet'
+                self.log.error('monitor Error: ' + msg)
+                raise ocferr.OCFErrGeneric(msg)
+            if routes_to_us and not routes_to_elsewhere:
+                # We are handling the traffic
+                self.log.info('monitor Success: static routes are pointing to us')
+                raise ocferr.OCFSuccess('Routes are pointing to us')
+            if not routes_to_us and routes_to_elsewhere:
+                # Our peer is handling the traffic
+                msg = ('Some static routes are pointing to another address in our subnet'
+                       ' (us:{}, elsewhere:{}) - it should not be the case'
+                       ' on a MASTER node').format(len(routes_to_us),
+                                                   len(routes_to_elsewhere))
+                self.log.info('monitor NotRunning: ' + msg)
+                raise ocferr.OCFNotRunning(msg)
+            if routes_to_us and routes_to_elsewhere:
+                # Some traffic comes to us, some goes elsewhere
+                msg = ('Some static routes are pointing to another address in our subnet'
+                       ' (us:{}, elsewhere:{}) - it should not be the case'
+                       ' on a MASTER node').format(len(routes_to_us),
+                                                   len(routes_to_elsewhere))
+                self.log.warning('monitor NotRunning: ' + msg)
+                raise ocferr.OCFNotRunning(msg)
+            self.log.error('monitor Error: something unexpected happened')
+            raise ocferr.OCFErrGeneric('Something unexpected happened')
+        except ocferr.OCFNotRunning:
+            raise
+        except ocferr.OCFSuccess:
+            raise
+        except ocferr.OCFErrGeneric:
+            if ignore_errors:
+                message = 'monitor FAILED but we are ignoring this failure to preserve cluster stability'
+                self.log.error(message)
+                raise ocferr.OCFSuccess(message)
+            self.log.error('monitor (probe) FAILED - we are _NOT_ ignoring this failure')
+            raise
+        except:
+            exctype, value = sys.exc_info()[:2]
+            self.log.error('uncaught error: %s - %s', exctype, value)
+            if ignore_errors:
+                message = 'monitor FAILED but we are ignoring this failure to preserve cluster stability'
+                self.log.error(message)
+                raise ocferr.OCFSuccess(message)
+            self.log.error('monitor (probe) FAILED - we are _NOT_ ignoring this failure')
+            raise
+
+    def handle_validate_all(self, timeout=20):
+        """
+        This method uses Azure API to fill in _connection and _routes object of
+        this class.
+        By doing so it also verifies if a managed identity has been assigned to
+        the VM and if (most of) the required roles are granted (most, because
+        we don't test "write" access here).
+        This method is called by both "monitor" and "start" ("stop" is a no-op),
+        also under try/except.
+        Note: the "timeout" parameter here isn't really used, but OCF developer
+        guide says all actions (including validate-all) *should* have a timeout
+        parameter, and pyocfagent blows up if there isn't enough parameters in
+        the method declaration.
+        """
+        # If it is not successful within _api_call_timeout seconds, an error is thrown.
+        signal.alarm(self._api_call_timeout)
+        self.log.debug('Initializing variables')
+        try:
+            # Does the interface exist?
+            # NOTE: we don't support more than 1 IP per interface
+            self.log.debug('Getting local interface IP address for %s', self.get_parameter('interface'))
+            our_ipv4 = netifaces.ifaddresses(self.get_parameter('interface'))[netifaces.AF_INET].pop()
+            # This _must_ be a unicode object. See:
+            # https://github.com/phihag/ipaddress/blob/master/README.md
+            self._our_address = ipaddress.ip_interface(u'{0}/{1}'.format(our_ipv4['addr'],
+                                                                         our_ipv4['netmask']))
+
+            # Authenticating with managed identity
+            self.log.debug('Getting access credentials based on the managed identity')
+            identity_config = {"mi_res_id": self.get_parameter('managed_identity_id')}
+            az_credential = ManagedIdentityCredential(identity_config=identity_config)
+
+            # Create instance of a NetworkManagementClient
+            self.log.debug('Initializing NetworkManagementClient')
+            # If the resource is busy when the API call is performed the call
+            # fails with a status code 409. By default, the SDK implementation
+            # will not perform a retry and will simply throw an exception.
+            # In order to force the SDK to retry we have to define a custom
+            # retry_policy. For details, see:
+            # https://github.com/Azure/azure-sdk-for-python/blob/7c4cfe236d113c59e66515b6315def256219aa6b/sdk/core/azure-core/azure/core/pipeline/policies/_retry.py
+            # We also take this opportunity to fine tune some value to better
+            # with our specific use-case.
+            retry_policy = RetryPolicy(retry_on_status_codes=set([409]),
+                                       retry_read=10,
+                                       retry_status=10,
+                                       retry_backoff_factor=2,
+                                       retry_backoff_max=20)
+            self._NMC = NetworkManagementClient(credential=az_credential,
+                                                subscription_id=self.get_parameter('subscription_id'),
+                                                retry_policy=retry_policy,)
+
+            self.log.debug('Getting NMC.hub_virtual_network_connections')
+            self._connection = self._NMC.hub_virtual_network_connections.get(
+                                    resource_group_name=self.get_parameter('resource_group'),
+                                    virtual_hub_name=self.get_parameter('vhub'),
+                                    connection_name=self.get_parameter('connection'),)
+
+            self.log.debug('Getting static routes for the Virtual Network connection')
+            routes_list = self._connection.routing_configuration.vnet_routes.static_routes
+
+            # Store routes in a list, as routes_list is a paged iterator and cannot be reset
+            self._routes = list(routes_list)
+            if len(self._routes) == 0:
+                self.log.error('There are no static routes on the Virtual Network connection!')
+                raise ocferr.OCFErrGeneric('There are no static routes on the Virtual Network connection!')
+
+        except ValueError:
+            message = 'The requested interface {} cannot be found'.format(self.get_parameter('interface'))
+            self.log.error(message)
+            raise ocferr.OCFErrInstalled(message)
+        except self.ApiCallTimeoutException:
+            message = 'API calls were not completed within {} seconds'.format(self._api_call_timeout)
+            self.log.error(message)
+            raise ocferr.OCFErrGeneric(message)
+        except CredentialUnavailableError as ce:
+            # managed identity isn't available
+            message = "The credential did not attempt to authenticate because required data or state is unavailable"
+            self.log.error(message)
+            raise ocferr.OCFErrGeneric(message)
+        except (ClientAuthenticationError, HttpResponseError) as aze:
+            # error response to API call
+            self.log.error(aze.message)
+            raise ocferr.OCFErrGeneric(aze.message)
+        finally:
+            signal.alarm(0)
+
+
+if __name__ == "__main__":
+    ocf = AzureVWanHa(testmode=False, debug_logging_enabled=True)
+    try:
+        ocf.cmdline_call()
+    except Exception as ex:
+        for line in traceback.format_exc(sys.exc_info()[2]).splitlines():
+            print('ERROR:', line)
+        raise ocferr.OCFErrGeneric(str(ex))
